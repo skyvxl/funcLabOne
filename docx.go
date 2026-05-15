@@ -33,6 +33,13 @@ type LetterData struct {
 	LetterBody            string
 	SenderPost            string
 	SenderName            string
+	Appendices            []Appendix
+}
+
+type Appendix struct {
+	Title string
+	Body  string
+	Pages string
 }
 
 type textNode struct {
@@ -72,13 +79,17 @@ func generateLetter(templatePath, outputPath string, data LetterData) error {
 			continue
 		}
 
-		bytes, err := readZipFile(file)
+		content, err := readZipFile(file)
 		if err != nil {
 			_ = writer.Close()
 			return err
 		}
-		if isWordXMLPart(file.Name) && utf8.Valid(bytes) {
-			bytes = []byte(applyReplacements(string(bytes), data))
+		if isWordXMLPart(file.Name) && utf8.Valid(content) {
+			docXML := applyReplacements(string(content), data)
+			if file.Name == "word/document.xml" {
+				docXML = injectAppendices(docXML, data.Appendices)
+			}
+			content = []byte(docXML)
 		}
 
 		part, err := writer.CreateHeader(&header)
@@ -86,7 +97,7 @@ func generateLetter(templatePath, outputPath string, data LetterData) error {
 			_ = writer.Close()
 			return err
 		}
-		if _, err := part.Write(bytes); err != nil {
+		if _, err := part.Write(content); err != nil {
 			_ = writer.Close()
 			return err
 		}
@@ -154,18 +165,150 @@ func replacementPairs(data LetterData) []replacementPair {
 		{"{LETTER_BODY}", data.LetterBody},
 		{"{SENDER_POST}", data.SenderPost},
 		{"{SENDER_NAME}", data.SenderName},
+		{"{APPENDIX_LIST}", buildAppendixList(data.Appendices)},
 	}
 }
 
-func replaceVisibleText(xmlText, target, replacement string) string {
-	if target == "" {
-		return xmlText
+func buildAppendixList(appendices []Appendix) string {
+	if len(appendices) == 0 {
+		return ""
 	}
-	start, end, ok := firstMatchRange(xmlText, target)
-	if !ok {
-		return xmlText
+	var sb strings.Builder
+	sb.WriteString("Приложение:")
+	for i, app := range appendices {
+		sb.WriteByte('\n')
+		sb.WriteString(fmt.Sprintf("%d. %s", i+1, app.Title))
+		if app.Pages != "" {
+			sb.WriteString(" на " + app.Pages + " л.")
+		}
 	}
-	return replaceVisibleTextRange(xmlText, start, end, replacement)
+	return sb.String()
+}
+
+func buildParaXML(align, text string) string {
+	t := `<w:t xml:space="preserve">` + escapeXMLText(text) + `</w:t>`
+	r := `<w:r>` + t + `</w:r>`
+	if align == "" {
+		return `<w:p>` + r + `</w:p>`
+	}
+	pPr := `<w:pPr><w:jc w:val="` + align + `"/></w:pPr>`
+	return `<w:p>` + pPr + r + `</w:p>`
+}
+
+func normalParaXML(text string) string   { return buildParaXML("", text) }
+func rightParaXML(text string) string    { return buildParaXML("right", text) }
+func centeredParaXML(text string) string { return buildParaXML("center", text) }
+
+func pageBreakXML() string {
+	return `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`
+}
+
+func injectAppendices(docXML string, appendices []Appendix) string {
+	if len(appendices) == 0 {
+		return docXML
+	}
+	xml := appendixSectionsXML(appendices)
+
+	if idx := strings.Index(docXML, "<w:sectPr"); idx >= 0 {
+		return docXML[:idx] + xml + docXML[idx:]
+	}
+	if idx := strings.LastIndex(docXML, "</w:body>"); idx >= 0 {
+		return docXML[:idx] + xml + docXML[idx:]
+	}
+	return docXML
+}
+
+func appendixSectionsXML(appendices []Appendix) string {
+	var sb strings.Builder
+	for i, app := range appendices {
+		sb.WriteString(pageBreakXML())
+
+		label := "Приложение"
+		if len(appendices) > 1 {
+			label = fmt.Sprintf("Приложение %d", i+1)
+		}
+		sb.WriteString(rightParaXML(label))
+		sb.WriteString(centeredParaXML(app.Title))
+		sb.WriteString(normalParaXML(""))
+
+		body := strings.ReplaceAll(strings.ReplaceAll(app.Body, "\r\n", "\n"), "\r", "\n")
+		for _, line := range strings.Split(body, "\n") {
+			sb.WriteString(normalParaXML(line))
+		}
+	}
+	return sb.String()
+}
+
+func ensureTemplatePlaceholders(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read template: %w", err)
+	}
+
+	reader, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		return fmt.Errorf("open template zip: %w", err)
+	}
+
+	for _, f := range reader.File {
+		if f.Name != "word/document.xml" {
+			continue
+		}
+		content, err := readZipFile(f)
+		if err != nil {
+			return fmt.Errorf("read document.xml: %w", err)
+		}
+		docXML := string(content)
+		if strings.Contains(docXML, "{APPENDIX_LIST}") {
+			return nil
+		}
+		docXML = injectParagraphAfter(docXML, "{LETTER_BODY}", normalParaXML("{APPENDIX_LIST}"))
+		return rewriteDocInZip(path, reader, "word/document.xml", []byte(docXML))
+	}
+	return nil
+}
+
+func injectParagraphAfter(docXML, placeholder, newParaXML string) string {
+	idx := strings.Index(docXML, placeholder)
+	if idx < 0 {
+		return docXML
+	}
+	pEndRel := strings.Index(docXML[idx:], "</w:p>")
+	if pEndRel < 0 {
+		return docXML
+	}
+	insertAt := idx + pEndRel + len("</w:p>")
+	return docXML[:insertAt] + newParaXML + docXML[insertAt:]
+}
+
+func rewriteDocInZip(path string, reader *zip.Reader, targetName string, newContent []byte) error {
+	var buf bytes.Buffer
+	w := zip.NewWriter(&buf)
+
+	for _, f := range reader.File {
+		header := f.FileHeader
+		part, err := w.CreateHeader(&header)
+		if err != nil {
+			return err
+		}
+		var content []byte
+		if f.Name == targetName {
+			content = newContent
+		} else {
+			content, err = readZipFile(f)
+			if err != nil {
+				return err
+			}
+		}
+		if _, err := part.Write(content); err != nil {
+			return err
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
 }
 
 func replaceVisibleTextAll(xmlText, target, replacement string) string {
@@ -203,26 +346,6 @@ func replaceVisibleTextAll(xmlText, target, replacement string) string {
 		updated = replaceVisibleTextRange(updated, matches[i][0], matches[i][1], replacement)
 	}
 	return updated
-}
-
-func firstMatchRange(xmlText, target string) (int, int, bool) {
-	nodes, ok := textNodes(xmlText)
-	if !ok {
-		return 0, 0, false
-	}
-
-	var visible strings.Builder
-	for _, node := range nodes {
-		visible.WriteString(node.text)
-	}
-
-	visibleText := visible.String()
-	byteStart := strings.Index(visibleText, target)
-	if byteStart < 0 {
-		return 0, 0, false
-	}
-	start := len([]rune(visibleText[:byteStart]))
-	return start, start + len([]rune(target)), true
 }
 
 func replaceVisibleTextRange(xmlText string, start, end int, replacement string) string {
@@ -280,11 +403,21 @@ func replaceVisibleTextRange(xmlText string, start, end int, replacement string)
 	last := 0
 	for i, node := range nodes {
 		output.WriteString(xmlText[last:node.contentStart])
-		output.WriteString(escapeXMLText(nodeTexts[i]))
+		writeTextContent(&output, nodeTexts[i])
 		last = node.contentEnd
 	}
 	output.WriteString(xmlText[last:])
 	return output.String()
+}
+
+func writeTextContent(w *strings.Builder, text string) {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if i > 0 {
+			w.WriteString(`</w:t><w:br/><w:t xml:space="preserve">`)
+		}
+		w.WriteString(escapeXMLText(line))
+	}
 }
 
 func textNodes(xmlText string) ([]textNode, bool) {
@@ -371,11 +504,11 @@ func docxContainsText(path, needle string) (bool, error) {
 		if !isWordXMLPart(file.Name) {
 			continue
 		}
-		bytes, err := readZipFile(file)
+		content, err := readZipFile(file)
 		if err != nil {
 			return false, err
 		}
-		if utf8.Valid(bytes) && strings.Contains(collectVisibleText(string(bytes)), needle) {
+		if utf8.Valid(content) && strings.Contains(collectVisibleText(string(content)), needle) {
 			return true, nil
 		}
 	}

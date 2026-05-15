@@ -12,9 +12,16 @@ import (
 const templateFile = "Шаблон.docx"
 
 type appState struct {
-	form   *tview.Form
-	status *tview.TextView
-	fields map[string]*tview.InputField
+	form       *tview.Form
+	status     *tview.TextView
+	fields     map[string]*tview.InputField
+	appendices []appendixFields
+}
+
+type appendixFields struct {
+	title *tview.InputField
+	body  *tview.InputField
+	pages *tview.InputField
 }
 
 type fieldSpec struct {
@@ -31,6 +38,17 @@ func main() {
 	state.form.SetBorder(true).SetTitle(" Генератор служебного письма ")
 	state.form.SetButtonsAlign(tview.AlignLeft)
 	installArrowNavigation(state.form)
+
+	state.form.AddButton("Добавить приложение", func() {
+		addAppendixFields(state)
+		state.status.SetTextColor(tcell.ColorGray).
+			SetText(fmt.Sprintf("Приложений: %d. Заполните поля и нажмите «Сформировать DOCX».", len(state.appendices)))
+	})
+	state.form.AddButton("Удалить приложение", func() {
+		removeAppendixFields(state)
+		state.status.SetTextColor(tcell.ColorGray).
+			SetText(fmt.Sprintf("Приложений: %d. Заполните поля и нажмите «Сформировать DOCX».", len(state.appendices)))
+	})
 	state.form.AddButton("Сформировать DOCX", func() {
 		path, err := generateFromForm(state)
 		if err != nil {
@@ -73,6 +91,37 @@ func newAppState() *appState {
 	}
 
 	return state
+}
+
+func addAppendixFields(state *appState) {
+	n := len(state.appendices) + 1
+	label := fmt.Sprintf("Прил. %d", n)
+
+	title := tview.NewInputField().
+		SetLabel(label + " - Заголовок: ").
+		SetFieldWidth(64)
+	body := tview.NewInputField().
+		SetLabel(label + " - Текст: ").
+		SetFieldWidth(64)
+	pages := tview.NewInputField().
+		SetLabel(label + " - Листов (необяз.): ").
+		SetFieldWidth(8)
+
+	state.form.AddFormItem(title)
+	state.form.AddFormItem(body)
+	state.form.AddFormItem(pages)
+	state.appendices = append(state.appendices, appendixFields{title, body, pages})
+}
+
+func removeAppendixFields(state *appState) {
+	if len(state.appendices) == 0 {
+		return
+	}
+	n := state.form.GetFormItemCount()
+	state.form.RemoveFormItem(n - 1)
+	state.form.RemoveFormItem(n - 2)
+	state.form.RemoveFormItem(n - 3)
+	state.appendices = state.appendices[:len(state.appendices)-1]
 }
 
 func installArrowNavigation(form *tview.Form) {
@@ -152,6 +201,10 @@ func generateFromForm(state *appState) (string, error) {
 		return "", fmt.Errorf("не найден шаблон %s", templatePath)
 	}
 
+	if err := ensureTemplatePlaceholders(templatePath); err != nil {
+		return "", fmt.Errorf("обновление шаблона: %w", err)
+	}
+
 	outputDir := filepath.Join(cwd, "generated")
 	outputPath := uniqueOutputPath(outputDir)
 	data := collectData(state)
@@ -174,6 +227,16 @@ func collectData(state *appState) LetterData {
 	get := func(key string) string {
 		return state.fields[key].GetText()
 	}
+
+	appendices := make([]Appendix, 0, len(state.appendices))
+	for _, af := range state.appendices {
+		appendices = append(appendices, Appendix{
+			Title: af.title.GetText(),
+			Body:  af.body.GetText(),
+			Pages: af.pages.GetText(),
+		})
+	}
+
 	return LetterData{
 		SenderCompanyFull:     get("sender_company_full"),
 		SenderCompanyShort:    get("sender_company_short"),
@@ -195,6 +258,7 @@ func collectData(state *appState) LetterData {
 		LetterBody:            get("letter_body"),
 		SenderPost:            get("sender_post"),
 		SenderName:            get("sender_name"),
+		Appendices:            appendices,
 	}
 }
 
